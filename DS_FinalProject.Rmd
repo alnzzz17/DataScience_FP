@@ -1,0 +1,876 @@
+---
+title: "DS_FinalProject"
+author: "Erllyta_Aprilia_Zulfikar"
+date: "2024-11-29"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Project Akhir Data Science
+# **Analisis Kendaraan Hilang untuk Meningkatkan Efektivitas Keamanan Publik**
+Erllyta Rachma Alifiah (123220008). Rizky Aprilia Ineztri U. (123220012), Zulfikar Aji Pangarso (123220035)
+
+*Tujuan:*
+Menganalisis pola dan tren pencurian kendaraan untuk mendukung pencegahan kejahatan dan pengalokasian sumber daya secara optimal
+
+## Import Library
+```{r import_library}
+library(tidyverse)
+library(tidymodels)
+library(lubridate)
+library(caret)
+library(nnet)
+
+library(ggplot2)
+library(RColorBrewer)
+library(pheatmap)
+library(gridExtra)
+library(scales)
+library(patchwork)
+library(factoextra)
+library(FactoMineR)
+
+library(cluster)
+library(clusterCrit)
+
+library(shiny)
+library(shinydashboard)
+library(DT)
+```
+
+## Import Dataset
+```{r import_dataset}
+stolen_vehicles <- read.csv("stolen_vehicles.csv")
+make_details <- read.csv("make_details.csv")
+locations <- read.csv("locations.csv")
+dictionary <- read.csv("stolen_vehicles_db_data_dictionary.csv")
+
+stolen_vehicles
+make_details
+locations
+dictionary
+```
+
+## Data Pre-Processing
+### 1. Data Merging
+Menggabungkan tabel produsen `make_details`dengan tabel pencurian kendaraan `stolen_vehicles` dan tabel wilayah `locations`, lalu disimpan di `merged_data`.
+```{r merge_dataset}
+merged_data <- make_details %>%
+  right_join(stolen_vehicles, by = "make_id") %>%
+  inner_join(locations, by = "location_id")
+
+merged_data
+str(merged_data)
+```
+
+### 2. Mengubah Tipe Data
+Mengubah tipe data pada field populasi `population` yang semula char menjadi num dan tanggal pencurian `date_stolen` yang semula chr menjadi Date.
+```{r}
+# Periksa tipe data awal
+str(merged_data)
+```
+
+```{r}
+
+# Hapus tanda koma dan ubah menjadi numerik
+merged_data <- merged_data %>%
+  mutate(
+    population = as.numeric(gsub(",", "", population)), # Menghapus koma pada kolom population
+    date_stolen = mdy(date_stolen) # Mengonversi kolom date_stolen ke Date menggunakan mdy()
+  )
+
+# Periksa hasil konversi
+str(merged_data)
+```
+
+### 3. Handling Missing Values
+- Mencari missing values yang terdefinisikan sebagai `NA`.
+```{r}
+# Memeriksa apakah ada missing value (NA)
+colSums(is.na(merged_data))
+
+# Cari baris yang memiliki setidaknya satu nilai kosong
+rows_with_na <- which(rowSums(is.na(merged_data)) > 0)
+
+# Menampilkan baris-baris tersebut
+rows_with_na
+```
+- Mengganti missing value yang tidak terdefiniskan dengan `NA` (misalnya string kosong atau spasi) dengan `NA`.
+```{r}
+# Ganti string kosong atau hanya spasi dengan NA
+merged_data <- merged_data %>%
+  mutate(across(everything(), ~ na_if(trimws(.), "")))
+
+# Cek jumlah missing value setelah konversi
+sapply(merged_data, function(x) sum(is.na(x)))
+
+# Ganti NA dengan nilai tertentu (contoh: 0 untuk kolom numerik)
+merged_data <- merged_data %>%
+  mutate(across(where(is.numeric), ~ replace_na(., 0)))
+
+# Menampilkan baris-baris tersebut
+rows_with_na
+
+merged_data
+```
+
+### 4. Data Filtering
+Memilih kolom-kolom yang akan digunakan dalam analisis time series dan modelling.
+```{r}
+# Mengelompokkan data berdasarkan 'location_id', menghitung jumlah, dan memilih kolom yang relevan
+location_data <- merged_data %>%
+  group_by(location_id) %>%
+  summarise(
+    region = first(region), 
+    count = n(),
+    population = as.numeric(first(population)),
+    density = as.numeric(first(density))
+  ) %>%
+  ungroup() %>%
+  mutate(location_id = as.integer(location_id)) %>% 
+  arrange(desc(count))
+
+# Menampilkan data yang telah digabungkan dan diolah
+location_data
+str(location_data)
+```
+
+## Exploratory Data Analysis (EDA)
+### 1. Risiko pencurian berdasarkan wilayah
+Analisis frekuensi kasus pencurian berdasarkan wilayah `region` untuk mengidentifikasi area dengan tingkat risiko pencurian tertinggi.
+```{r}
+# Membuat bar chart menggunakan ggplot2
+risk_by_region <- ggplot(location_data, aes(x = reorder(region, -count), y = count, fill = region)) +
+  geom_bar(stat = "identity", show.legend = FALSE) +  # Bar chart tanpa legenda
+  labs(title = "Risiko Pencurian Berdasarkan Wilayah",
+       x = "Wilayah", y = "Jumlah Pencurian") +
+  theme_minimal() +                                  # Tema minimal
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+risk_by_region
+```
+
+### 2. Sebaran Data Dilihat dari Segi Wilayah
+Sebaran data kepadatan `density`, jumlah pencurian `count`, dan populasi `population` di semua wilayah `regions` sebelum di normalisasi dan setelah di normalisasi.
+```{r}
+# Membuat fungsi normalisasi Min-Max
+normalize <- function(x) {
+  if (all(is.na(x))) return(x) # Return as is if all values are NA
+  (x - min(x, na.rm = TRUE)) / (max(x, na.rm = TRUE) - min(x, na.rm = TRUE))
+}
+
+# Memilih kolom numerik untuk analisis
+numeric_cols <- c("population", "density", "count")
+
+# Menormalisasi dataset dengan kolom baru
+normalized_data <- location_data %>%
+  mutate(across(all_of(numeric_cols), 
+                .fns = ~ normalize(.), 
+                .names = "{.col}_normalized"))
+
+# Mengubah data asli ke format long
+original_long <- location_data %>%
+  pivot_longer(cols = all_of(numeric_cols), 
+               names_to = "variable",
+               values_to = "original_value")
+
+# Mengubah data normalisasi ke format long
+normalized_long <- normalized_data %>%
+  pivot_longer(cols = matches("_normalized$"), 
+               names_to = "variable",
+               values_to = "normalized_value") %>%
+  mutate(variable = str_remove(variable, "_normalized"))
+
+# Membuat Boxplot
+# Sebelum dinormalisasi
+og_dist <- ggplot(original_long, aes(x = variable, y = original_value, fill = variable)) +
+  geom_boxplot(alpha = 0.8, outlier.shape = 21, outlier.size = 2, outlier.fill = "white") +
+  labs(title = "Sebaran Data: Sebelum Normalisasi", x = "Variables", y = "Value") +
+  scale_fill_manual(values = c("#f39c12", "#3498db", "#e74c3c")) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+# Setelah dinormalisasi
+norm_dist <- ggplot(normalized_long, aes(x = variable, y = normalized_value, fill = variable)) +
+  geom_boxplot(alpha = 0.8, outlier.shape = 21, outlier.size = 2, outlier.fill = "white") +
+  labs(title = "Sebaran Data: Setelah Normalisasi", x = "Variables", y = "Normalized Value") +
+  scale_fill_manual(values = c("#f39c12", "#3498db", "#e74c3c")) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+# Menampilkan boxplot
+og_dist
+norm_dist
+```
+
+### 3. Distribusi Frekuensi Pencurian Kendaraan Per Bulan
+Analisis distribusi frekuensi pencurian kendaraan per bulan untuk mengidentifikasi tren atau pola musiman.
+```{r}
+# Tambahkan kolom waktu (format DateTime)
+data <- merged_data %>%
+  mutate(theft_date = as.Date(date_stolen),
+         month_year = format(theft_date, "%b %Y"))
+
+# Filter data untuk periode tertentu (Oktober 2021 - April 2022)
+data_filtered <- data %>%
+  filter(theft_date >= as.Date("2021-10-01") & theft_date <= as.Date("2022-04-30"))
+
+# Distribusi pencurian berdasarkan bulan dan tahun
+monthly_theft <- data_filtered %>%
+  group_by(month_year) %>%
+  summarise(count = n()) %>%
+  mutate(month_year = factor(month_year, levels = c(
+  "Oct 2021", "Nov 2021", "Dec 2021", "Jan 2022", "Feb 2022", "Mar 2022", "Apr 2022"
+))) %>%
+  arrange(month_year)
+
+monthly_theft
+str(monthly_theft)
+nrow(data_filtered)
+
+# Visualisasi
+monthly_theft_dist <- ggplot(monthly_theft, aes(x = month_year, y = count, group = 1)) +
+  geom_line(color = "steelblue", size = 1) +
+  geom_point(color = "steelblue", size = 2) +
+  labs(title = "Distribusi Pencurian Kendaraan per Bulan dan Tahun",
+       x = "Bulan dan Tahun", y = "Jumlah Pencurian") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) 
+
+monthly_theft_dist
+```
+
+### 4. Jumlah Pencurian Per Bulan dan Wilayah
+Analisis jumlah pencurian kendaraan per bulan `month` dan wilayah `region` menggunakan heatmap untuk mengidentifikasi pola kejadian berdasarkan waktu dan lokasi.
+```{r}
+# Transformasi data
+time_region_data <- data %>%
+  filter(!is.na(region) & !is.na(month_year)) %>%
+  group_by(month_year, region) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  pivot_wider(names_from = region, values_from = count, values_fill = 0) %>%
+  arrange(factor(month_year, levels = c(
+    "Oct 2021", "Nov 2021", "Dec 2021", "Jan 2022", "Feb 2022", "Mar 2022", "Apr 2022"
+  )))
+
+# Konversi ke matriks
+time_region_matrix <- as.matrix(time_region_data[, -1])
+rownames(time_region_matrix) <- as.character(time_region_data$month_year)
+
+# Warna heatmap
+heatmap_colors <- colorRampPalette(brewer.pal(9, "Reds"))(100)
+
+# Plot heatmap
+month_region_dist <- pheatmap(
+  time_region_matrix,
+  cluster_rows = FALSE,  # Tidak mengelompokkan baris
+  cluster_cols = TRUE,   # Mengelompokkan kolom
+  display_numbers = TRUE,  # Tampilkan angka pada kotak
+  color = heatmap_colors,
+  main = "Distribusi Pencurian per Bulan dan Wilayah",
+  fontsize_row = 10,   # Ukuran teks baris
+  fontsize_col = 10,   # Ukuran teks kolom
+  number_format = "%.0f",  # Format angka tanpa desimal
+  legend = TRUE        # Menampilkan legenda
+)
+
+month_region_dist
+```
+
+### 5. Hubungan antara Tingkat Pencurian dengan Kepadatan dan Populasi
+Analisis hubungan antara tingkat pencurian `theft_rate`, kepadatan penduduk `density`, dan populasi `population`.
+```{r}
+# Ubah kolom density dan population menjadi numerik
+location_data$density <- as.numeric(as.character(location_data$density))
+location_data$population = as.numeric(gsub(",", "", as.character(location_data$population)))
+
+# Buat kolom theft_rate per 1.000 orang
+region_theft_data <- location_data %>%
+  mutate(theft_rate = (count / population) * 1000)
+
+region_theft_data
+
+# Visualisasi hubungan antara theft_rate dengan density dan population
+# Theft Rate vs Density
+theft_density <- ggplot(region_theft_data, aes(x = density, y = theft_rate, color = region)) +
+  geom_point(size = 3) +
+  labs(
+    title = "Tingkat Pencurian vs Kepadatan",
+    x = "Kepadatan Populasi (orang/km²)",
+    y = "Tingkat Pencurian (per 1,000 orang)"
+  ) +
+  theme_minimal()
+
+theft_density
+
+# Theft Rate vs Population
+theft_population <- ggplot(region_theft_data, aes(x = population, y = theft_rate, color = region)) +
+  geom_point(size = 3) +
+  labs(
+    title = "Tingkat Pencurian vs Populasi",
+    x = "Populasi",
+    y = "Tingkat Pencurian (per 1,000 orang)"
+  ) +
+  theme_minimal()
+
+theft_population
+```
+
+### 6. Analisis Tipe Manufacturer terhadap Tingkat Pencurian
+Analisis hubungan antara tipe manufacturer `make_type` (Luxury dan Standard) berpengaruh terhadap tingkat pencurian `theft_count`.
+```{r}
+# Data preprocessing: Mneghitung pencurian berdasarkan `make_type`
+theft_data <- merged_data %>%
+  group_by(make_type) %>%
+  summarise(theft_count = n()) %>%
+  arrange(desc(theft_count))
+
+theft_data
+
+# Visualisasi: Bar plot berdasarkan `make_type`
+make_type_dist <- ggplot(theft_data, aes(x = reorder(make_type, -theft_count), y = theft_count, fill = make_type)) +
+  geom_bar(stat = "identity") +
+  labs(
+    title = "Hubungan Antara Manufacturer dengan Jumlah Pencurian",
+    x = "Manufacturer",
+    y = "Jumlah Pencurian"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(hjust = 1)) +
+  scale_fill_brewer(palette = "Set3")
+
+make_type_dist
+```
+
+### 7. Distribusi Jenis Kendaraan yang Dicuri
+Analisis frekuensi jenis kendaraan `vehicle_type` untuk mengetahui jenis kendaraan yang paling sering dilaporkan hilang.
+```{r}
+# Distribusi jenis kendaraan
+vehicle_distribution <- merged_data %>%
+  group_by(vehicle_type) %>%
+  summarise(count = n()) %>%
+  arrange(desc(count)) %>%
+  mutate(percentage = count / sum(count) * 100)
+
+vehicle_distribution
+
+top_vehicle_distribution <- vehicle_distribution %>% slice(1)
+
+# Plot distribusi jenis kendaraan
+vehicle_dist <- ggplot(vehicle_distribution, aes(x = reorder(vehicle_type, -count), y = count)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(title = "Distribusi Jenis Kendaraan yang Dicuri",
+       x = "Jenis Kendaraan",
+       y = "Jumlah Pencurian") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+vehicle_dist
+```
+
+### 8. Distribusi Warna Kendaraan yang Dicuri
+Analisis frekuensi warna kendaraan `color` untuk mengetahui warna kendaraan yang paling sering dilaporkan hilang.
+```{r}
+color_distribution <- merged_data %>%
+  group_by(color) %>%
+  summarise(count = n()) %>%
+  arrange(desc(count))
+
+# Tampilkan data distribusi warna kendaraan
+color_distribution
+
+# Visualisasi persebaran warna kendaraan menggunakan bar chart
+color_dist <- ggplot(color_distribution, aes(x = reorder(color, -count), y = count, fill = color)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Persebaran Warna Kendaraan yang Dicuri",
+       x = "Warna Kendaraan",
+       y = "Jumlah Kasus") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+color_dist
+```
+
+### 9. Distribusi Model Year Kendaraan yang dicuri
+Analisis frekuensi tahun pembuatan kendaraan model_year untuk mengetahui tahun kendaraan yang paling sering dilaporkan hilang pada rentang tahun tersebut.
+```{r}
+# Filter data untuk tahun 1990 hingga 2003
+filtered_data <- merged_data %>%
+  filter(model_year >= 1990 & model_year <= 2022)
+
+# Hitung distribusi model year
+model_year_distribution <- filtered_data %>%
+  group_by(model_year) %>%
+  summarise(count = n()) %>%
+  arrange(model_year)  # Urutkan berdasarkan tahun
+
+# Tampilkan data distribusi model year kendaraan
+print(model_year_distribution)
+
+# Visualisasi persebaran model year kendaraan menggunakan bar chart
+ggplot(model_year_distribution, aes(x = model_year, y = count, fill = as.factor(model_year))) +
+  geom_bar(stat = "identity") +
+  labs(title = "Persebaran Model Year Kendaraan yang Dicuri (1990-2022)",
+       x = "Tahun Pembuatan Kendaraan",
+       y = "Jumlah Kasus") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_discrete(name = "Model Year")
+```
+
+## Modelling
+### 1. Clustering
+Untuk mengidentifikasi wilayah dengan tingkat pencurian tertinggi.
+Mengelompokkan wilayah berdasarkan tingkat risiko pencurian kendaraan.
+Alasan: Mempermudah identifikasi hotspot pencurian kendaraan dan alokasi sumber daya keamanan.
+
+- Buat model dengan algoritma K-Means
+```{r}
+clustering_data <- normalized_data
+
+View(normalized_data)
+
+# Penerapan K-Means
+set.seed(250)
+kmeans_result <- kmeans(normalized_data$count_normalized, centers = 3)
+
+# Menambahkan hasil clustering ke data
+clustering_data$cluster <- kmeans_result$cluster
+
+# Menentukan urutan cluster berdasarkan rata-rata count
+cluster_summary <- clustering_data %>%
+  group_by(cluster) %>%
+  summarise(avg_count = mean(count)) %>%
+  arrange(desc(avg_count))
+
+# Buat mapping untuk label cluster
+cluster_mapping <- setNames(1:3, cluster_summary$cluster)
+
+# Ganti label cluster berdasarkan urutan
+clustering_data$cluster <- factor(clustering_data$cluster, 
+                                  levels = names(cluster_mapping),
+                                  labels = cluster_mapping)
+
+clustering_data
+```
+
+- Wilayah dengan cluster 1 (cluster dengan angka pencurian tertinggi)
+```{r}
+# Identifikasi cluster paling rawan
+high_risk_cluster <- clustering_data$cluster[1]
+
+# Filter data untuk wilayah dalam cluster paling rawan
+high_risk_area <- clustering_data %>%
+  filter(cluster == high_risk_cluster)
+
+# Tampilkan wilayah-wilayah di cluster paling rawan
+high_risk_area
+```
+
+- Visualisasi
+```{r}
+# Visualisasi
+bar_cluster <- ggplot(clustering_data, aes(x = reorder(region, -count), y = count, fill = cluster)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Clustering Wilayah Berdasarkan Tingkat Pencurian",
+       x = "Wilayah", y = "Jumlah Pencurian") +
+  scale_fill_brewer(palette = "Set2") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Visualisasi dengan plot titik
+point_cluster <- ggplot(clustering_data, aes(x = count, y = count_normalized, color = cluster)) +
+  geom_point(size = 4) +
+  geom_text(aes(label = region), vjust = -1, hjust = 0.5, size = 3) +
+  labs(title = "Clustering Wilayah Berdasarkan Tingkat Pencurian",
+       x = "Jumlah Pencurian",
+       y = "Nilai Normalisasi",
+       color = "Cluster") +
+  scale_color_brewer(palette = "Set2") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    legend.position = "right"
+  )
+
+# Tambahkan dimensi acak untuk PCA
+set.seed(123)
+clustering_data$random_dim <- runif(nrow(clustering_data)) # Nilai acak antara 0 dan 1
+
+# Data untuk PCA
+pca_data <- clustering_data[, c("count_normalized", "random_dim")]
+
+# Jalankan PCA
+pca_result <- PCA(pca_data, graph = FALSE)
+
+# Visualisasi cluster
+pca_cluster <- fviz_cluster(
+  object = list(data = pca_result$ind$coord, cluster = as.numeric(clustering_data$cluster)), 
+  geom = "point",
+  ellipse.type = "convex",
+  palette = "Set2",
+  ggtheme = theme_minimal(),
+  main = "Visualisasi Cluster"
+) +
+  labs(
+    x = paste0("Dim1 (", round(pca_result$eig[1, 2], 1), "% Variansi)"),
+    y = paste0("Dim2 (", round(pca_result$eig[2, 2], 1), "% Variansi)"),
+    color = "Cluster"
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    legend.position = "right"
+  ) + guides(fill = "none", shape = "none")
+
+bar_cluster
+point_cluster
+pca_cluster
+```
+
+- Evaluasi dengan Silhouette Score, DBI, dan CH Index
+```{r}
+
+# Silhouette Score
+dist_matrix <- dist(clustering_data$count_normalized)
+silhouette_score <- silhouette(as.numeric(clustering_data$cluster), dist_matrix)
+
+# Mean Silhouette Score
+mean(silhouette_score[, 3])
+
+# Konversi cluster ke integer
+clusters_int <- as.integer(as.character(clustering_data$cluster))
+
+# Davies-Bouldin Index
+dbi <- intCriteria(as.matrix(clustering_data$count_normalized), 
+                   clusters_int, 
+                   c("Davies_Bouldin"))
+dbi$davies_bouldin
+
+# Calinski-Harabasz Index
+ch_index <- intCriteria(as.matrix(clustering_data$count_normalized), 
+                        clusters_int, 
+                        c("Calinski_Harabasz"))
+ch_index$calinski_harabasz
+
+```
+**Penjelasan**
+1.Silhouette Score: 0.6559316
+    Range: Nilai Silhouette Score berkisar antara -1 dan 1:
+    Mendekati 1: Cluster sangat kompak dan dipisahkan dengan baik.
+    Mendekati 0: Cluster kurang jelas terpisah.
+    Negatif: Anggota cluster mungkin salah diklasifikasikan.
+    Interpretasi:
+    Dengan nilai 0.656, clustering Anda tergolong sangat baik. Ini menunjukkan bahwa data dalam setiap cluster relatif homogen (kompak) dan cluster yang berbeda memiliki pemisahan yang cukup jelas.
+    
+2. Davies-Bouldin Index (DBI): 0.2910114
+    Range: Nilai DBI lebih rendah lebih baik, dengan idealnya mendekati 0.
+    DBI mengevaluasi rasio jarak antar-cluster dengan ukuran cluster.
+    DBI yang rendah menunjukkan cluster yang kecil dan saling berjauhan.
+    Interpretasi:
+    Dengan nilai 0.291, clustering Anda sangat baik. Nilai ini menunjukkan bahwa cluster memiliki pemisahan spasial yang jelas dan bentuk cluster yang konsisten.
+
+3. Calinski-Harabasz Index (CH Index): 140.3854
+    Range: Nilai CH Index lebih tinggi lebih baik.
+    CH Index mengevaluasi rasio antara jarak antar-cluster (inter-cluster) dengan jarak dalam cluster             (intra-cluster).
+    Semakin tinggi nilai CH Index, semakin baik kualitas clustering.
+    Interpretasi:
+    Dengan nilai 140.4, clustering Anda sangat baik. Ini menunjukkan bahwa cluster memiliki jarak antar-cluster yang signifikan dan data dalam cluster cukup terpusat.
+
+
+## UI - Shiny
+```{r}
+# UI
+ui <- fluidPage(
+  titlePanel("Analisis Kendaraan Hilang untuk Meningkatkan Efektivitas Keamanan Publik"),
+
+      tabsetPanel(
+        id = "content_tabs",
+        tabPanel(
+          "Dashboard",
+          fluidRow(
+            column(4, valueBoxOutput("total_count", width = NULL)),
+            column(4, valueBoxOutput("high_risk_area", width = NULL)),
+            column(4, valueBoxOutput("top_vehicle_distribution", width = NULL))
+          ), tags$br(),
+            plotOutput("monthly_theft_dist", height = "400px")
+        ),
+        tabPanel(
+          "Data Pencurian",
+          fluidRow(
+            DTOutput("data_table", width = "100%")
+          )
+        ),
+        tabPanel(
+          "Pencurian di Setiap Region",
+          fluidRow(
+            DTOutput("data_table_region", width = "100%")
+          )
+        ),
+        tabPanel(
+          "Analisis Visual",
+          fluidRow(
+            plotOutput("risk_by_region", height = "400px"),
+            tags$br(),
+            plotOutput("month_region_dist", height = "400px"),
+            tags$br(),
+            plotOutput("color_dist", height = "400px"),
+            tags$br(),
+            plotOutput("vehicle_dist", height = "400px"),
+            tags$br(),
+            plotOutput("make_type_dist", height = "400px"),
+            tags$br(),
+            plotOutput("og_dist", height = "400px"),
+            tags$br(),
+            plotOutput("norm_dist", height = "400px"),
+            tags$br(),
+            plotOutput("theft_density", height = "400px"),
+            tags$br(),
+            plotOutput("theft_population", height = "400px")
+          )
+        ),
+    tabPanel(
+      "Clustering",
+      sidebarLayout(
+        sidebarPanel(
+          numericInput("n_clusters", "Jumlah Cluster (k):", value = 3, min = 2, max = 10),
+          actionButton("run_clustering", "Jalankan Clustering")
+        ),
+        mainPanel(
+          fluidRow(
+            plotOutput("bar_cluster", height = "400px"),
+            tags$br(),
+            plotOutput("point_cluster", height = "400px"),
+            tags$br(),
+            plotOutput("pca_cluster", height = "400px")
+          )
+        )
+      )
+    ),
+    tabPanel(
+      "Evaluasi",
+      fluidRow(
+        # Penjelasan di atas evaluasi
+        column(
+          12,
+          tags$h4("Penjelasan Evaluasi"),
+          tags$ol(
+            tags$li(tags$b("Silhouette Score"), ": Nilai berkisar antara -1 dan 1. ",
+                    tags$ul(
+                      tags$li("Mendekati 1: Cluster sangat kompak dan dipisahkan dengan baik."),
+                      tags$li("Mendekati 0: Cluster kurang jelas terpisah."),
+                      tags$li("Negatif: Anggota cluster mungkin salah diklasifikasikan.")
+                    )),
+            tags$li(tags$b("Davies-Bouldin Index (DBI)"), ": Nilai lebih rendah lebih baik, dengan idealnya mendekati 0.",
+                    tags$ul(
+                      tags$li("DBI mengevaluasi rasio jarak antar-cluster dengan ukuran cluster."),
+                      tags$li("Nilai rendah menunjukkan cluster kecil dan berjauhan.")
+                    )),
+            tags$li(tags$b("Calinski-Harabasz Index (CH Index)"), ": Nilai lebih tinggi lebih baik.",
+                    tags$ul(
+                      tags$li("CH Index mengevaluasi rasio antara jarak antar-cluster dan jarak dalam cluster."),
+                      tags$li("Nilai tinggi menunjukkan kualitas clustering yang baik.")
+                    ))
+          )
+        )
+      ),
+      tags$hr(),
+      fluidRow(
+        column(4, verbatimTextOutput("silhouette_score")),
+        column(4, verbatimTextOutput("davies_bouldin")),
+        column(4, verbatimTextOutput("calinski_harabasz"))
+      )
+        )
+    )
+)
+
+
+# Server
+server <- function(input, output) {
+  
+  output$total_count <- renderValueBox({
+    # Hitung total pencurian
+    total_pencurian <- sum(location_data$count)
+    
+    valueBox(value = total_pencurian, subtitle = "Total Pencurian", icon = icon("motorcycle"))
+  })
+  
+  output$high_risk_area <- renderValueBox({
+    valueBox(high_risk_area$region, "Wilayah Risiko Tinggi", icon = icon("map-marker-alt"))
+  })
+  
+  output$top_vehicle_distribution <- renderValueBox({
+    top_vehicle <- top_vehicle_distribution$vehicle_type
+    top_percentage <- round(top_vehicle_distribution$percentage, 2)
+
+    valueBox(
+      value = paste0(top_vehicle, " (", top_percentage, "%)"), subtitle = "Tipe Kendaraan Paling Dicuri",       icon = icon("car")
+    )
+  })
+  
+  output$risk_by_region <- renderPlot({
+    risk_by_region
+  })
+  
+  output$monthly_theft_dist <- renderPlot({
+    monthly_theft_dist
+  })
+  
+  output$month_region_dist <- renderPlot({
+    month_region_dist
+  })
+  
+  output$vehicle_dist <- renderPlot({
+    vehicle_dist
+  })
+  
+  output$color_dist <- renderPlot({
+    color_dist
+  })
+  
+  output$make_type_dist <- renderPlot({
+    make_type_dist
+  })
+  
+  output$theft_density <- renderPlot({
+    theft_density
+  })
+  
+  output$theft_population <- renderPlot({
+    theft_population
+  })
+  
+  output$og_dist <- renderPlot({
+    og_dist
+  })
+  
+  output$norm_dist <- renderPlot({
+    norm_dist
+  })
+  
+# Clustering Logic
+observeEvent(input$run_clustering, {
+  # Persiapan Data Clustering
+  clustering_data <- merged_data %>%
+    group_by(region) %>%
+    summarise(count = n()) %>%
+    mutate(count_normalized = (count - min(count)) / (max(count) - min(count)))
+
+  # Penerapan K-Means
+  set.seed(250)
+  kmeans_result <- kmeans(clustering_data$count_normalized, centers = input$n_clusters)
+  clustering_data$cluster <- as.factor(kmeans_result$cluster)
+
+  # Penentuan Urutan Cluster Berdasarkan Rata-Rata Count
+  cluster_summary <- clustering_data %>%
+    group_by(cluster) %>%
+    summarise(avg_count = mean(count)) %>%
+    arrange(desc(avg_count))
+
+  # Pemetaan Label Cluster
+  cluster_mapping <- setNames(1:input$n_clusters, cluster_summary$cluster)
+  clustering_data$cluster <- factor(clustering_data$cluster,
+                                    levels = names(cluster_mapping),
+                                    labels = cluster_mapping)
+
+  # Visualisasi Bar Chart
+  bar_cluster <- ggplot(clustering_data, aes(x = reorder(region, -count), y = count, fill = cluster)) +
+    geom_bar(stat = "identity") +
+    labs(
+      title = "Clustering Wilayah Berdasarkan Tingkat Pencurian",
+      x = "Wilayah", y = "Jumlah Pencurian"
+    ) +
+    scale_fill_brewer(palette = "Set2") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+  # Visualisasi Scatter Plot
+  point_cluster <- ggplot(clustering_data, aes(x = count, y = count_normalized, color = cluster)) +
+    geom_point(size = 4) +
+    geom_text(aes(label = region), vjust = -1, hjust = 0.5, size = 3) +
+    labs(
+      title = "Clustering Wilayah Berdasarkan Tingkat Pencurian",
+      x = "Jumlah Pencurian", y = "Nilai Normalisasi", color = "Cluster"
+    ) +
+    scale_color_brewer(palette = "Set2") +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5),
+      legend.position = "right"
+    )
+
+  # Tambahan Dimensi Acak untuk PCA
+  set.seed(123)
+  clustering_data$random_dim <- runif(nrow(clustering_data))
+
+  # Data dan Proses PCA
+  pca_data <- clustering_data[, c("count_normalized", "random_dim")]
+  pca_result <- PCA(pca_data, graph = FALSE)
+
+  # Visualisasi PCA Cluster
+  pca_cluster <- fviz_cluster(
+    object = list(data = pca_result$ind$coord, cluster = as.numeric(clustering_data$cluster)),
+    geom = "point",
+    ellipse.type = "convex",
+    palette = "Set2",
+    ggtheme = theme_minimal(),
+    main = "Visualisasi Cluster Berdasarkan PCA"
+  ) +
+    labs(
+      x = paste0("Dim1 (", round(pca_result$eig[1, 2], 1), "% Variansi)"),
+      y = paste0("Dim2 (", round(pca_result$eig[2, 2], 1), "% Variansi)"),
+      color = "Cluster"
+    ) +
+    theme(
+      plot.title = element_text(hjust = 0.5),
+      legend.position = "right"
+    ) + guides(fill = "none", shape = "none")
+
+  # Render Visualisasi
+  output$bar_cluster <- renderPlot({ bar_cluster })
+  output$point_cluster <- renderPlot({ point_cluster })
+  output$pca_cluster <- renderPlot({ pca_cluster })
+
+  # Evaluasi Metrics
+  dist_matrix <- dist(clustering_data$count_normalized)
+  silhouette_score <- silhouette(as.numeric(clustering_data$cluster), dist_matrix)
+
+  # Evaluasi: Silhouette Score
+  output$silhouette_score <- renderText({
+    paste("Silhouette Score:", round(mean(silhouette_score[, 3]), 3))
+  })
+
+  # Evaluasi: Davies-Bouldin Index
+  clusters_int <- as.integer(as.character(clustering_data$cluster))
+  dbi <- intCriteria(as.matrix(clustering_data$count_normalized), clusters_int, c("Davies_Bouldin"))
+  output$davies_bouldin <- renderText({
+    paste("Davies-Bouldin Index (DBI):", round(dbi$davies_bouldin, 3))
+  })
+
+  # Evaluasi: Calinski-Harabasz Index
+  ch_index <- intCriteria(as.matrix(clustering_data$count_normalized), clusters_int, c("Calinski_Harabasz"))
+  output$calinski_harabasz <- renderText({
+    paste("Calinski-Harabasz Index (CH):", round(ch_index$calinski_harabasz, 3))
+  })
+})
+  
+  output$data_table_region <- renderDT({
+    datatable(location_data, options = list(pageLength = 20))
+  })
+  
+  output$data_table <- renderDT({
+    datatable(merged_data, options = list(pageLength = 20))
+  })
+}
+
+shinyApp(ui, server)
+```
+
