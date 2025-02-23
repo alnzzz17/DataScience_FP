@@ -101,13 +101,13 @@ ggplot(normalized_data, aes(x = count, y = density, color = as.factor(cluster)))
 
 ## Recommendations
 1. **Enhancing Security in High-Risk Areas**
-   - Focus on Auckland with increased surveillance cameras and patrol intensity.
+   Focus on Auckland with increased surveillance cameras and patrol intensity.
 2. **Public Awareness Campaigns**
-   - Educate citizens on vehicle theft prevention strategies based on high-risk regions.
+   Educate citizens on vehicle theft prevention strategies based on high-risk regions.
 3. **Adopting Security Technologies**
-   - Implement alarm systems and GPS tracking for vehicles.
+   Implement alarm systems and GPS tracking for vehicles.
 4. **Collaboration with Authorities**
-   - Utilize data to support more effective public security policies.
+   Utilize data to support more effective public security policies.
 
 ## Conclusion
 Vehicle theft analysis using **K-Means Clustering** successfully identified regions with high, medium, and low theft risks. These insights enable targeted security strategies to reduce vehicle theft in vulnerable areas.
